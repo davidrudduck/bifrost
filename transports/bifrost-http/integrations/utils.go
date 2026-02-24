@@ -12,6 +12,7 @@ import (
 	"github.com/bytedance/sonic"
 	bifrost "github.com/maximhq/bifrost/core"
 	"github.com/maximhq/bifrost/core/schemas"
+	"github.com/maximhq/bifrost/transports/bifrost-http/lib"
 	"github.com/valyala/fasthttp"
 )
 
@@ -225,6 +226,37 @@ func (g *GenericRouter) sendSuccess(ctx *fasthttp.RequestCtx, bifrostCtx *schema
 	}
 
 	ctx.SetBody(responseBody)
+}
+
+// tryStreamLargeResponse checks if large response mode was activated by the provider,
+// sets the transport marker, and streams the response directly to the client.
+// Returns true if the response was handled (caller should return).
+func (g *GenericRouter) tryStreamLargeResponse(ctx *fasthttp.RequestCtx, bifrostCtx *schemas.BifrostContext) bool {
+	isLargeResponse, ok := bifrostCtx.Value(schemas.BifrostContextKeyLargeResponseMode).(bool)
+	if !ok || !isLargeResponse {
+		return false
+	}
+	if g.streamLargeResponse(ctx, bifrostCtx) {
+		ctx.SetUserValue(lib.FastHTTPUserValueLargeResponseMode, true)
+	}
+	return true
+}
+
+// streamLargeResponse streams the large response body directly from the upstream provider to the client.
+// This bypasses the normal serialize → set body path, piping the response bytes unchanged.
+func (g *GenericRouter) streamLargeResponse(ctx *fasthttp.RequestCtx, bifrostCtx *schemas.BifrostContext) bool {
+	// Enterprise hook: wrap the reader with Phase B scanning (e.g., usage extraction
+	// from the full response stream) before streaming to client.
+	if g.largeResponseHook != nil {
+		g.largeResponseHook(ctx, bifrostCtx)
+	}
+
+	if !lib.StreamLargeResponseBody(ctx, bifrostCtx) {
+		ctx.SetStatusCode(fasthttp.StatusInternalServerError)
+		ctx.SetBodyString("large response reader not available")
+		return false
+	}
+	return true
 }
 
 // extractAndParseFallbacks extracts fallbacks from the integration request and adds them to the BifrostRequest

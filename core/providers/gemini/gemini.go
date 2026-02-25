@@ -6,10 +6,12 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"io"
 	"mime/multipart"
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/bytedance/sonic"
@@ -2284,10 +2286,33 @@ func (provider *GeminiProvider) BatchCreate(ctx *schemas.BifrostContext, key sch
 			FileName: fileID,
 		}
 	} else {
-		// Inline requests: use requests in input_config
+		// Inline requests: convert Bifrost requests to Gemini format
+		geminiRequests := make([]GeminiBatchRequestItem, len(request.Requests))
+		for i, bifrostItem := range request.Requests {
+			requestBytes, err := sonic.Marshal(bifrostItem.Body)
+			if err != nil {
+				return nil, providerUtils.NewBifrostOperationError("failed to marshal gemini request", err, providerName)
+			}
+			var geminiReq GeminiBatchGenerateContentRequest
+			err = sonic.Unmarshal(requestBytes, &geminiReq)
+			if err != nil {
+				return nil, providerUtils.NewBifrostOperationError("failed to unmarshal gemini request", err, providerName)
+			}
+
+			geminiRequests[i] = GeminiBatchRequestItem{
+				Request: geminiReq,
+			}
+			// Set metadata with custom_id
+			if bifrostItem.CustomID != "" {
+				geminiRequests[i].Metadata = &GeminiBatchMetadata{
+					Key: bifrostItem.CustomID,
+				}
+			}
+		}
+
 		batchReq.Batch.InputConfig = GeminiBatchInputConfig{
 			Requests: &GeminiBatchRequestsWrapper{
-				Requests: buildBatchRequestItems(request.Requests),
+				Requests: geminiRequests,
 			},
 		}
 	}
@@ -2811,6 +2836,88 @@ func (provider *GeminiProvider) BatchCancel(ctx *schemas.BifrostContext, keys []
 	return nil, lastError
 }
 
+// batchDeleteByKey deletes a batch job for Gemini for a single key.
+// batches.delete indicates the client is no longer interested in the operation result.
+// It does not cancel the operation. If the server doesn't support this method, it returns UNIMPLEMENTED.
+func (provider *GeminiProvider) batchDeleteByKey(ctx *schemas.BifrostContext, key schemas.Key, request *schemas.BifrostBatchDeleteRequest) (*schemas.BifrostBatchDeleteResponse, *schemas.BifrostError) {
+	providerName := provider.GetProviderKey()
+
+	req := fasthttp.AcquireRequest()
+	resp := fasthttp.AcquireResponse()
+	defer fasthttp.ReleaseRequest(req)
+	defer fasthttp.ReleaseResponse(resp)
+
+	batchID := request.BatchID
+	var requestURL string
+	if strings.HasPrefix(batchID, "batches/") {
+		requestURL = fmt.Sprintf("%s/%s", provider.networkConfig.BaseURL, batchID)
+	} else {
+		requestURL = fmt.Sprintf("%s/batches/%s", provider.networkConfig.BaseURL, batchID)
+	}
+
+	provider.logger.Debug("gemini batch delete url: " + requestURL)
+	providerUtils.SetExtraHeaders(ctx, req, provider.networkConfig.ExtraHeaders, nil)
+	req.SetRequestURI(requestURL)
+	req.Header.SetMethod(http.MethodDelete)
+	if key.Value.GetValue() != "" {
+		req.Header.Set("x-goog-api-key", key.Value.GetValue())
+	}
+
+	latency, bifrostErr := providerUtils.MakeRequestWithContext(ctx, provider.client, req, resp)
+	if bifrostErr != nil {
+		return nil, bifrostErr
+	}
+
+	if resp.StatusCode() != fasthttp.StatusOK && resp.StatusCode() != fasthttp.StatusNoContent {
+		return nil, parseGeminiError(resp, &providerUtils.RequestMetadata{
+			Provider:    providerName,
+			RequestType: schemas.BatchDeleteRequest,
+		})
+	}
+
+	return &schemas.BifrostBatchDeleteResponse{
+		ID:     request.BatchID,
+		Object: "batch",
+		Status: schemas.BatchStatusCompleted,
+		ExtraFields: schemas.BifrostResponseExtraFields{
+			RequestType: schemas.BatchDeleteRequest,
+			Provider:    providerName,
+			Latency:     latency.Milliseconds(),
+		},
+	}, nil
+}
+
+// BatchDelete deletes a batch job for Gemini, trying each key until successful.
+// This indicates the client is no longer interested in the operation result.
+// It does not cancel the operation. If the server doesn't support this method, it returns UNIMPLEMENTED.
+func (provider *GeminiProvider) BatchDelete(ctx *schemas.BifrostContext, keys []schemas.Key, request *schemas.BifrostBatchDeleteRequest) (*schemas.BifrostBatchDeleteResponse, *schemas.BifrostError) {
+	if err := providerUtils.CheckOperationAllowed(schemas.Gemini, provider.customProviderConfig, schemas.BatchDeleteRequest); err != nil {
+		return nil, err
+	}
+
+	providerName := provider.GetProviderKey()
+
+	if request.BatchID == "" {
+		return nil, providerUtils.NewBifrostOperationError("batch_id is required", nil, providerName)
+	}
+
+	if len(keys) == 0 {
+		return nil, providerUtils.NewBifrostOperationError("no keys provided for batch delete", nil, providerName)
+	}
+
+	var lastError *schemas.BifrostError
+	for _, key := range keys {
+		resp, err := provider.batchDeleteByKey(ctx, key, request)
+		if err == nil {
+			return resp, nil
+		}
+		lastError = err
+		provider.logger.Debug("BatchDelete failed for key %s: %v", key.Name, err.Error)
+	}
+
+	return nil, lastError
+}
+
 // processGeminiStreamChunk processes a single chunk from Gemini streaming response
 func processGeminiStreamChunk(jsonData string) (*GenerateContentResponse, error) {
 	// Quick check for error field (allocation-free using sonic.GetFromString)
@@ -3236,6 +3343,10 @@ func (provider *GeminiProvider) fileListByKey(ctx *schemas.BifrostContext, key s
 		if t, err := time.Parse(time.RFC3339, file.CreateTime); err == nil {
 			createdAt = t.Unix()
 		}
+		var updatedAt int64
+		if t, err := time.Parse(time.RFC3339, file.UpdateTime); err == nil {
+			updatedAt = t.Unix()
+		}
 
 		var expiresAt *int64
 		if file.ExpirationTime != "" {
@@ -3250,6 +3361,7 @@ func (provider *GeminiProvider) fileListByKey(ctx *schemas.BifrostContext, key s
 			Object:    "file",
 			Bytes:     sizeBytes,
 			CreatedAt: createdAt,
+			UpdatedAt: updatedAt,
 			Filename:  file.DisplayName,
 			Purpose:   schemas.FilePurposeVision,
 			Status:    ToBifrostFileStatus(file.State),
@@ -3392,6 +3504,11 @@ func (provider *GeminiProvider) fileRetrieveByKey(ctx *schemas.BifrostContext, k
 		createdAt = t.Unix()
 	}
 
+	var updatedAt int64
+	if t, err := time.Parse(time.RFC3339, geminiResp.UpdateTime); err == nil {
+		updatedAt = t.Unix()
+	}
+
 	var expiresAt *int64
 	if geminiResp.ExpirationTime != "" {
 		if t, err := time.Parse(time.RFC3339, geminiResp.ExpirationTime); err == nil {
@@ -3405,6 +3522,7 @@ func (provider *GeminiProvider) fileRetrieveByKey(ctx *schemas.BifrostContext, k
 		Object:         "file",
 		Bytes:          sizeBytes,
 		CreatedAt:      createdAt,
+		UpdatedAt:      updatedAt,
 		Filename:       geminiResp.DisplayName,
 		Purpose:        schemas.FilePurposeVision,
 		Status:         ToBifrostFileStatus(geminiResp.State),
@@ -3468,6 +3586,7 @@ func (provider *GeminiProvider) fileDeleteByKey(ctx *schemas.BifrostContext, key
 	requestURL := fmt.Sprintf("%s/%s", provider.networkConfig.BaseURL, fileID)
 
 	providerUtils.SetExtraHeaders(ctx, req, provider.networkConfig.ExtraHeaders, nil)
+	fmt.Println("request URL: ", requestURL)
 	req.SetRequestURI(requestURL)
 	req.Header.SetMethod(http.MethodDelete)
 	req.Header.SetContentType("application/json")
@@ -3483,11 +3602,15 @@ func (provider *GeminiProvider) fileDeleteByKey(ctx *schemas.BifrostContext, key
 
 	// Handle error response - DELETE returns 200 with empty body on success
 	if resp.StatusCode() != fasthttp.StatusOK && resp.StatusCode() != fasthttp.StatusNoContent {
+		fmt.Println("resp from file delete error: ", string(resp.Body()))
+		fmt.Println("resp status code: ", resp.StatusCode())
 		return nil, parseGeminiError(resp, &providerUtils.RequestMetadata{
 			Provider:    providerName,
 			RequestType: schemas.FileDeleteRequest,
 		})
 	}
+
+	fmt.Println("resp from file delete success: ", string(resp.Body()))
 
 	return &schemas.BifrostFileDeleteResponse{
 		ID:      request.FileID,
@@ -3698,4 +3821,172 @@ func (provider *GeminiProvider) ContainerFileContent(_ *schemas.BifrostContext, 
 // ContainerFileDelete is not supported by the Gemini provider.
 func (provider *GeminiProvider) ContainerFileDelete(_ *schemas.BifrostContext, _ []schemas.Key, _ *schemas.BifrostContainerFileDeleteRequest) (*schemas.BifrostContainerFileDeleteResponse, *schemas.BifrostError) {
 	return nil, providerUtils.NewUnsupportedOperationError(schemas.ContainerFileDeleteRequest, provider.GetProviderKey())
+}
+
+func (provider *GeminiProvider) Passthrough(
+	ctx *schemas.BifrostContext,
+	key schemas.Key,
+	req *schemas.BifrostPassthroughRequest,
+) (*schemas.BifrostPassthroughResponse, *schemas.BifrostError) {
+	url := provider.networkConfig.BaseURL + req.Path
+	if req.RawQuery != "" {
+		url += "?" + req.RawQuery
+	}
+
+	url = strings.Replace(url, "v1beta/upload/v1beta", "upload/v1beta", 1)
+
+	fasthttpReq := fasthttp.AcquireRequest()
+	resp := fasthttp.AcquireResponse()
+	defer fasthttp.ReleaseResponse(resp)
+	defer fasthttp.ReleaseRequest(fasthttpReq)
+
+	fasthttpReq.Header.SetMethod(req.Method)
+	fasthttpReq.SetRequestURI(url)
+
+	providerUtils.SetExtraHeaders(ctx, fasthttpReq, provider.networkConfig.ExtraHeaders, nil)
+
+	for k, v := range req.SafeHeaders {
+		fasthttpReq.Header.Set(k, v)
+	}
+
+	if key.Value.GetValue() != "" {
+		fasthttpReq.Header.Set("x-goog-api-key", key.Value.GetValue())
+	}
+
+	fasthttpReq.SetBody(req.Body)
+
+	if err := provider.client.Do(fasthttpReq, resp); err != nil {
+		return nil, providerUtils.NewBifrostOperationError(schemas.ErrProviderDoRequest, err, provider.GetProviderKey())
+	}
+
+	headers := make(map[string]string)
+	resp.Header.All()(func(key, value []byte) bool {
+		headers[string(key)] = string(value)
+		return true
+	})
+	body, err := providerUtils.CheckAndDecodeBody(resp)
+	if err != nil {
+		return nil, providerUtils.NewBifrostOperationError("failed to decode response body", err, provider.GetProviderKey())
+	}
+	// Remove Content-Encoding since we've decompressed the body; otherwise clients will try to decompress again and fail
+	for k := range headers {
+		if strings.EqualFold(k, "Content-Encoding") {
+			delete(headers, k)
+			break
+		}
+	}
+	bifrostResponse := &schemas.BifrostPassthroughResponse{
+		StatusCode: resp.StatusCode(),
+		Headers:    headers,
+		Body:       body,
+	}
+
+	bifrostResponse.ExtraFields.Provider = provider.GetProviderKey()
+	bifrostResponse.ExtraFields.ModelRequested = req.Model
+	bifrostResponse.ExtraFields.RequestType = schemas.PassthroughRequest
+
+	if providerUtils.ShouldSendBackRawRequest(ctx, provider.sendBackRawRequest) {
+		providerUtils.ParseAndSetRawRequest(&bifrostResponse.ExtraFields, fasthttpReq.Body())
+	}
+
+	return bifrostResponse, nil
+}
+
+// geminiPassthroughStreamBody wraps a fasthttp streaming response body as an io.ReadCloser.
+// Close drains and releases the underlying fasthttp.Response exactly once.
+type geminiPassthroughStreamBody struct {
+	io.Reader
+	once sync.Once
+	resp *fasthttp.Response
+}
+
+func (b *geminiPassthroughStreamBody) Close() error {
+	b.once.Do(func() {
+		if bodyStream := b.resp.BodyStream(); bodyStream != nil {
+			if closer, ok := bodyStream.(io.Closer); ok {
+				closer.Close()
+			}
+		}
+		fasthttp.ReleaseResponse(b.resp)
+	})
+	return nil
+}
+
+func (provider *GeminiProvider) PassthroughStream(
+	ctx *schemas.BifrostContext,
+	key schemas.Key,
+	req *schemas.BifrostPassthroughRequest,
+) (*schemas.BifrostPassthroughStreamResponse, *schemas.BifrostError) {
+	url := provider.networkConfig.BaseURL + req.Path
+	if req.RawQuery != "" {
+		url += "?" + req.RawQuery
+	}
+
+	url = strings.Replace(url, "v1beta/upload/v1beta", "upload/v1beta", 1)
+
+	fasthttpReq := fasthttp.AcquireRequest()
+	resp := fasthttp.AcquireResponse()
+	resp.StreamBody = true
+	defer fasthttp.ReleaseRequest(fasthttpReq)
+
+	fasthttpReq.Header.SetMethod(req.Method)
+	fasthttpReq.SetRequestURI(url)
+
+	providerUtils.SetExtraHeaders(ctx, fasthttpReq, provider.networkConfig.ExtraHeaders, nil)
+	for k, v := range req.SafeHeaders {
+		fasthttpReq.Header.Set(k, v)
+	}
+
+	if key.Value.GetValue() != "" {
+		fasthttpReq.Header.Set("x-goog-api-key", key.Value.GetValue())
+	}
+
+	fasthttpReq.SetBody(req.Body)
+
+	if err := provider.client.Do(fasthttpReq, resp); err != nil {
+		providerUtils.ReleaseStreamingResponse(resp)
+		return nil, providerUtils.NewBifrostOperationError(schemas.ErrProviderDoRequest, err, provider.GetProviderKey())
+	}
+
+	headers := make(map[string]string)
+	resp.Header.All()(func(k, v []byte) bool {
+		headers[string(k)] = string(v)
+		return true
+	})
+
+	for k := range headers {
+		if strings.EqualFold(k, "Content-Encoding") {
+			delete(headers, k)
+			break
+		}
+	}
+
+	bodyStream := resp.BodyStream()
+	if bodyStream == nil {
+		providerUtils.ReleaseStreamingResponse(resp)
+		return nil, providerUtils.NewBifrostOperationError(
+			"provider returned an empty stream body",
+			fmt.Errorf("provider returned an empty stream body"),
+			provider.GetProviderKey(),
+		)
+	}
+
+	body := schemas.WrapOnClose(io.NopCloser(bodyStream), func() {
+		providerUtils.ReleaseStreamingResponse(resp)
+	})
+
+	streamResp := &schemas.BifrostPassthroughStreamResponse{
+		StatusCode: resp.StatusCode(),
+		Headers:    headers,
+		Body: &geminiPassthroughStreamBody{
+			Reader: body,
+			resp:   resp,
+		},
+	}
+
+	streamResp.ExtraFields.Provider = provider.GetProviderKey()
+	streamResp.ExtraFields.ModelRequested = req.Model
+	streamResp.ExtraFields.RequestType = schemas.PassthroughStreamRequest
+
+	return streamResp, nil
 }

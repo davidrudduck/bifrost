@@ -212,6 +212,7 @@ type AllowedRequests struct {
 	BatchList             bool `json:"batch_list"`
 	BatchRetrieve         bool `json:"batch_retrieve"`
 	BatchCancel           bool `json:"batch_cancel"`
+	BatchDelete           bool `json:"batch_delete"`
 	BatchResults          bool `json:"batch_results"`
 	FileUpload            bool `json:"file_upload"`
 	FileList              bool `json:"file_list"`
@@ -294,6 +295,8 @@ func (ar *AllowedRequests) IsOperationAllowed(operation RequestType) bool {
 		return ar.BatchRetrieve
 	case BatchCancelRequest:
 		return ar.BatchCancel
+	case BatchDeleteRequest:
+		return ar.BatchDelete
 	case BatchResultsRequest:
 		return ar.BatchResults
 	case FileUploadRequest:
@@ -516,6 +519,8 @@ type Provider interface {
 	BatchRetrieve(ctx *BifrostContext, keys []Key, request *BifrostBatchRetrieveRequest) (*BifrostBatchRetrieveResponse, *BifrostError)
 	// BatchCancel cancels a batch job
 	BatchCancel(ctx *BifrostContext, keys []Key, request *BifrostBatchCancelRequest) (*BifrostBatchCancelResponse, *BifrostError)
+	// BatchDelete deletes a batch job
+	BatchDelete(ctx *BifrostContext, keys []Key, request *BifrostBatchDeleteRequest) (*BifrostBatchDeleteResponse, *BifrostError)
 	// BatchResults retrieves results from a completed batch job
 	BatchResults(ctx *BifrostContext, keys []Key, request *BifrostBatchResultsRequest) (*BifrostBatchResultsResponse, *BifrostError)
 	// FileUpload uploads a file to the provider
@@ -546,4 +551,9 @@ type Provider interface {
 	ContainerFileContent(ctx *BifrostContext, keys []Key, request *BifrostContainerFileContentRequest) (*BifrostContainerFileContentResponse, *BifrostError)
 	// ContainerFileDelete deletes a file from a container
 	ContainerFileDelete(ctx *BifrostContext, keys []Key, request *BifrostContainerFileDeleteRequest) (*BifrostContainerFileDeleteResponse, *BifrostError)
+	// Passthrough executes a non-streaming passthrough; body is fully buffered.
+	Passthrough(ctx *BifrostContext, key Key, req *BifrostPassthroughRequest) (*BifrostPassthroughResponse, *BifrostError)
+	// PassthroughStream executes a streaming passthrough; caller MUST close Body.
+	PassthroughStream(ctx *BifrostContext, key Key, req *BifrostPassthroughRequest) (*BifrostPassthroughStreamResponse,
+		*BifrostError)
 }

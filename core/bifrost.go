@@ -1846,6 +1846,47 @@ func (bifrost *Bifrost) BatchCancelRequest(ctx *schemas.BifrostContext, req *sch
 	return response.BatchCancelResponse, nil
 }
 
+// BatchDeleteRequest deletes a batch job.
+func (bifrost *Bifrost) BatchDeleteRequest(ctx *schemas.BifrostContext, req *schemas.BifrostBatchDeleteRequest) (*schemas.BifrostBatchDeleteResponse, *schemas.BifrostError) {
+	if req == nil {
+		return nil, &schemas.BifrostError{
+			IsBifrostError: false,
+			Error: &schemas.ErrorField{
+				Message: "batch delete request is nil",
+			},
+		}
+	}
+	if req.Provider == "" {
+		return nil, &schemas.BifrostError{
+			IsBifrostError: false,
+			Error: &schemas.ErrorField{
+				Message: "provider is required for batch delete request",
+			},
+		}
+	}
+	if req.BatchID == "" {
+		return nil, &schemas.BifrostError{
+			IsBifrostError: false,
+			Error: &schemas.ErrorField{
+				Message: "batch_id is required for batch delete request",
+			},
+		}
+	}
+	if ctx == nil {
+		ctx = bifrost.ctx
+	}
+
+	bifrostReq := bifrost.getBifrostRequest()
+	bifrostReq.RequestType = schemas.BatchDeleteRequest
+	bifrostReq.BatchDeleteRequest = req
+
+	response, err := bifrost.handleRequest(ctx, bifrostReq)
+	if err != nil {
+		return nil, err
+	}
+	return response.BatchDeleteResponse, nil
+}
+
 // BatchResultsRequest retrieves results from a completed batch job.
 func (bifrost *Bifrost) BatchResultsRequest(ctx *schemas.BifrostContext, req *schemas.BifrostBatchResultsRequest) (*schemas.BifrostBatchResultsResponse, *schemas.BifrostError) {
 	if req == nil {
@@ -2108,6 +2149,215 @@ func (bifrost *Bifrost) FileContentRequest(ctx *schemas.BifrostContext, req *sch
 		return nil, err
 	}
 	return response.FileContentResponse, nil
+}
+
+func (bifrost *Bifrost) Passthrough(
+	ctx *schemas.BifrostContext,
+	provider schemas.ModelProvider,
+	req *schemas.BifrostPassthroughRequest,
+) (*schemas.BifrostPassthroughResponse, *schemas.BifrostError) {
+	if ctx == nil {
+		ctx = bifrost.ctx
+	}
+	if req == nil {
+		sc := fasthttp.StatusBadRequest
+		return nil, &schemas.BifrostError{
+			IsBifrostError: false,
+			StatusCode:     &sc,
+			Error:          &schemas.ErrorField{Message: "passthrough request is nil"},
+		}
+	}
+	if provider == "" {
+		sc := fasthttp.StatusBadRequest
+		return nil, &schemas.BifrostError{
+			IsBifrostError: false,
+			StatusCode:     &sc,
+			Error:          &schemas.ErrorField{Message: "provider is required for passthrough request"},
+		}
+	}
+	p := bifrost.getProviderByKey(provider)
+	if p == nil {
+		sc := fasthttp.StatusNotFound
+		return nil, &schemas.BifrostError{
+			IsBifrostError: false,
+			StatusCode:     &sc,
+			Error: &schemas.ErrorField{
+				Message: fmt.Sprintf("provider %s not configured", provider),
+			},
+		}
+	}
+
+	// Key selection — reuses existing weighted selection logic
+	// Use req.Model when available (extracted from path/body in handlePassthrough) for key filtering
+	model := ""
+	if req.Model != "" {
+		model = req.Model
+	}
+	key, err := bifrost.selectKeyFromProviderForModel(ctx, schemas.PassthroughRequest, provider, model, provider)
+	if err != nil {
+		sc := fasthttp.StatusServiceUnavailable
+		return nil, &schemas.BifrostError{
+			IsBifrostError: false,
+			StatusCode:     &sc,
+			Error:          &schemas.ErrorField{Message: err.Error(), Error: err},
+		}
+	}
+
+	req.Provider = provider // populate for GetRequestFields in plugin pipeline
+
+	// build BifrostRequest for pipeline
+	bifrostReq := bifrost.getBifrostRequest()
+	defer bifrost.releaseBifrostRequest(bifrostReq)
+	bifrostReq.RequestType = schemas.PassthroughRequest
+	bifrostReq.PassthroughRequest = req
+
+	// run pre-hooks
+	pipeline := bifrost.getPluginPipeline()
+	defer bifrost.releasePluginPipeline(pipeline)
+	_, shortCircuit, preCount := pipeline.RunLLMPreHooks(ctx, bifrostReq)
+	if shortCircuit != nil {
+		if shortCircuit.Response != nil {
+			resp, bifrostErr := pipeline.RunPostLLMHooks(ctx, shortCircuit.Response, nil, preCount)
+			if bifrostErr != nil {
+				return nil, bifrostErr
+			}
+			return resp.PassthroughResponse, nil
+		}
+		if shortCircuit.Error != nil {
+			resp, bifrostErr := pipeline.RunPostLLMHooks(ctx, nil, shortCircuit.Error, preCount)
+			if bifrostErr != nil {
+				return nil, bifrostErr
+			}
+			if resp != nil && resp.PassthroughResponse != nil {
+				return resp.PassthroughResponse, nil
+			}
+			return nil, shortCircuit.Error
+		}
+	}
+
+	// call provider
+	response, bifrostErr := p.Passthrough(ctx, key, req)
+	if bifrostErr != nil {
+		bifrostResp, postErr := pipeline.RunPostLLMHooks(ctx, nil, bifrostErr, preCount)
+		if postErr != nil {
+			return nil, postErr
+		}
+		if bifrostResp != nil && bifrostResp.PassthroughResponse != nil {
+			return bifrostResp.PassthroughResponse, nil
+		}
+		return nil, bifrostErr
+	}
+
+	// wrap in BifrostResponse for post-hooks
+	bifrostResp := &schemas.BifrostResponse{PassthroughResponse: response}
+	bifrostResp.PassthroughResponse.ExtraFields.RequestType = schemas.PassthroughRequest
+	bifrostResp.PassthroughResponse.ExtraFields.Provider = provider
+
+	bifrostResp, bifrostErr = pipeline.RunPostLLMHooks(ctx, bifrostResp, nil, preCount)
+	if bifrostErr != nil {
+		return nil, bifrostErr
+	}
+	return bifrostResp.PassthroughResponse, nil
+}
+
+func (bifrost *Bifrost) PassthroughStream(
+	ctx *schemas.BifrostContext,
+	provider schemas.ModelProvider,
+	req *schemas.BifrostPassthroughRequest,
+) (*schemas.BifrostPassthroughStreamResponse, *schemas.BifrostError) {
+	if ctx == nil {
+		ctx = bifrost.ctx
+	}
+	if req == nil {
+		sc := fasthttp.StatusBadRequest
+		return nil, &schemas.BifrostError{
+			IsBifrostError: false,
+			StatusCode:     &sc,
+			Error:          &schemas.ErrorField{Message: "passthrough request is nil"},
+		}
+	}
+	if provider == "" {
+		sc := fasthttp.StatusBadRequest
+		return nil, &schemas.BifrostError{
+			IsBifrostError: false,
+			StatusCode:     &sc,
+			Error:          &schemas.ErrorField{Message: "provider is required for passthrough request"},
+		}
+	}
+	p := bifrost.getProviderByKey(provider)
+	if p == nil {
+		sc := fasthttp.StatusNotFound
+		return nil, &schemas.BifrostError{
+			IsBifrostError: false,
+			StatusCode:     &sc,
+			Error:          &schemas.ErrorField{Message: fmt.Sprintf("provider %s not configured", provider)},
+		}
+	}
+
+	model := req.Model
+	key, err := bifrost.selectKeyFromProviderForModel(ctx, schemas.PassthroughStreamRequest, provider, model, provider)
+	if err != nil {
+		sc := fasthttp.StatusServiceUnavailable
+		return nil, &schemas.BifrostError{
+			IsBifrostError: false,
+			StatusCode:     &sc,
+			Error:          &schemas.ErrorField{Message: err.Error(), Error: err},
+		}
+	}
+
+	req.Provider = provider
+
+	bifrostReq := bifrost.getBifrostRequest()
+	bifrostReq.RequestType = schemas.PassthroughStreamRequest
+	bifrostReq.PassthroughRequest = req
+
+	pipeline := bifrost.getPluginPipeline()
+	_, shortCircuit, preCount := pipeline.RunLLMPreHooks(ctx, bifrostReq)
+	if shortCircuit != nil {
+		bifrost.releaseBifrostRequest(bifrostReq)
+		bifrost.releasePluginPipeline(pipeline)
+		if shortCircuit.Response != nil {
+			resp, bifrostErr := pipeline.RunPostLLMHooks(ctx, shortCircuit.Response, nil, preCount)
+			if bifrostErr != nil {
+				return nil, bifrostErr
+			}
+			if resp != nil && resp.PassthroughStreamResponse != nil {
+				return resp.PassthroughStreamResponse, nil
+			}
+		}
+		if shortCircuit.Error != nil {
+			return nil, shortCircuit.Error
+		}
+	}
+
+	streamResp, bifrostErr := p.PassthroughStream(ctx, key, req)
+	if bifrostErr != nil {
+		_, postErr := pipeline.RunPostLLMHooks(ctx, nil, bifrostErr, preCount)
+		bifrost.releaseBifrostRequest(bifrostReq)
+		bifrost.releasePluginPipeline(pipeline)
+		if postErr != nil {
+			return nil, postErr
+		}
+		return nil, bifrostErr
+	}
+
+	streamResp.ExtraFields.RequestType = schemas.PassthroughStreamRequest
+	streamResp.ExtraFields.Provider = provider
+
+	// Wrap Body — PostLLMHook fires + resources released when transport calls Close()
+	streamResp.Body = schemas.WrapOnClose(streamResp.Body, func() {
+		bifrostResp := &schemas.BifrostResponse{
+			PassthroughStreamResponse: &schemas.BifrostPassthroughStreamResponse{
+				StatusCode:  streamResp.StatusCode,
+				Headers:     streamResp.Headers,
+				ExtraFields: streamResp.ExtraFields,
+			},
+		}
+		pipeline.RunPostLLMHooks(ctx, bifrostResp, nil, preCount)
+		bifrost.releaseBifrostRequest(bifrostReq)
+		bifrost.releasePluginPipeline(pipeline)
+	})
+	return streamResp, nil
 }
 
 // ExecuteChatMCPTool executes an MCP tool call and returns the result as a chat message.
@@ -4960,6 +5210,12 @@ func (bifrost *Bifrost) handleProviderRequest(provider schemas.Provider, req *Ch
 			return nil, bifrostError
 		}
 		response.BatchCancelResponse = batchCancelResponse
+	case schemas.BatchDeleteRequest:
+		batchDeleteResponse, bifrostError := provider.BatchDelete(req.Context, keys, req.BifrostRequest.BatchDeleteRequest)
+		if bifrostError != nil {
+			return nil, bifrostError
+		}
+		response.BatchDeleteResponse = batchDeleteResponse
 	case schemas.BatchResultsRequest:
 		batchResultsResponse, bifrostError := provider.BatchResults(req.Context, keys, req.BifrostRequest.BatchResultsRequest)
 		if bifrostError != nil {
@@ -5649,6 +5905,7 @@ func resetBifrostRequest(req *schemas.BifrostRequest) {
 	req.BatchListRequest = nil
 	req.BatchRetrieveRequest = nil
 	req.BatchCancelRequest = nil
+	req.BatchDeleteRequest = nil
 	req.BatchResultsRequest = nil
 	req.ContainerCreateRequest = nil
 	req.ContainerListRequest = nil
@@ -5659,6 +5916,7 @@ func resetBifrostRequest(req *schemas.BifrostRequest) {
 	req.ContainerFileRetrieveRequest = nil
 	req.ContainerFileContentRequest = nil
 	req.ContainerFileDeleteRequest = nil
+	req.PassthroughRequest = nil
 }
 
 // getBifrostRequest gets a BifrostRequest from the pool

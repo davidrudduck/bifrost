@@ -154,6 +154,12 @@ func triggerMigrations(ctx context.Context, db *gorm.DB) error {
 	if err := migrationAddVideoColumns(ctx, db); err != nil {
 		return err
 	}
+	if err := migrationAddPassthroughRequestBodyColumn(ctx, db); err != nil {
+		return err
+	}
+	if err := migrationAddPassthroughResponseBodyColumn(ctx, db); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -1504,6 +1510,72 @@ func migrationAddVideoColumns(ctx context.Context, db *gorm.DB) error {
 	err := m.Migrate()
 	if err != nil {
 		return fmt.Errorf("error while adding video columns: %s", err.Error())
+	}
+	return nil
+}
+
+func migrationAddPassthroughRequestBodyColumn(ctx context.Context, db *gorm.DB) error {
+	opts := *migrator.DefaultOptions
+	opts.UseTransaction = true
+	m := migrator.New(db, &opts, []*migrator.Migration{{
+		ID: "logs_add_passthrough_request_body_column",
+		Migrate: func(tx *gorm.DB) error {
+			tx = tx.WithContext(ctx)
+			migrator := tx.Migrator()
+			if !migrator.HasColumn(&Log{}, "passthrough_request_body") {
+				if err := migrator.AddColumn(&Log{}, "passthrough_request_body"); err != nil {
+					return err
+				}
+			}
+			return nil
+		},
+		Rollback: func(tx *gorm.DB) error {
+			tx = tx.WithContext(ctx)
+			migrator := tx.Migrator()
+			if migrator.HasColumn(&Log{}, "passthrough_request_body") {
+				if err := migrator.DropColumn(&Log{}, "passthrough_request_body"); err != nil {
+					return err
+				}
+			}
+			return nil
+		},
+	}})
+	err := m.Migrate()
+	if err != nil {
+		return fmt.Errorf("error while adding passthrough request body column: %s", err.Error())
+	}
+	return nil
+}
+
+func migrationAddPassthroughResponseBodyColumn(ctx context.Context, db *gorm.DB) error {
+	opts := *migrator.DefaultOptions
+	opts.UseTransaction = true
+	m := migrator.New(db, &opts, []*migrator.Migration{{
+		ID: "logs_add_passthrough_response_body_column",
+		Migrate: func(tx *gorm.DB) error {
+			tx = tx.WithContext(ctx)
+			migrator := tx.Migrator()
+			if !migrator.HasColumn(&Log{}, "passthrough_response_body") {
+				if err := migrator.AddColumn(&Log{}, "passthrough_response_body"); err != nil {
+					return err
+				}
+			}
+			return nil
+		},
+		Rollback: func(tx *gorm.DB) error {
+			tx = tx.WithContext(ctx)
+			migrator := tx.Migrator()
+			if migrator.HasColumn(&Log{}, "passthrough_response_body") {
+				if err := migrator.DropColumn(&Log{}, "passthrough_response_body"); err != nil {
+					return err
+				}
+			}
+			return nil
+		},
+	}})
+	err := m.Migrate()
+	if err != nil {
+		return fmt.Errorf("error while adding passthrough response body column: %s", err.Error())
 	}
 	return nil
 }

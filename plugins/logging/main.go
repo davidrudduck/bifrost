@@ -91,20 +91,21 @@ type LogMessage struct {
 
 // InitialLogData contains data for initial log entry creation
 type InitialLogData struct {
-	Status                string
-	Provider              string
-	Model                 string
-	Object                string
-	InputHistory          []schemas.ChatMessage
-	ResponsesInputHistory []schemas.ResponsesMessage
-	Params                interface{}
-	SpeechInput           *schemas.SpeechInput
-	TranscriptionInput    *schemas.TranscriptionInput
-	ImageGenerationInput  *schemas.ImageGenerationInput
-	VideoGenerationInput  *schemas.VideoGenerationInput
-	Tools                 []schemas.ChatTool
-	RoutingEngineUsed     []string
-	Metadata              map[string]interface{}
+	Status                 string
+	Provider               string
+	Model                  string
+	Object                 string
+	InputHistory           []schemas.ChatMessage
+	ResponsesInputHistory  []schemas.ResponsesMessage
+	Params                 interface{}
+	SpeechInput            *schemas.SpeechInput
+	TranscriptionInput     *schemas.TranscriptionInput
+	ImageGenerationInput   *schemas.ImageGenerationInput
+	VideoGenerationInput   *schemas.VideoGenerationInput
+	Tools                  []schemas.ChatTool
+	RoutingEngineUsed      []string
+	Metadata               map[string]interface{}
+	PassthroughRequestBody string // Raw body for passthrough requests (UTF-8)
 }
 
 // LogCallback is a function that gets called when a new log entry is created
@@ -387,6 +388,15 @@ func (p *LoggerPlugin) PreLLMHook(ctx *schemas.BifrostContext, req *schemas.Bifr
 		case schemas.VideoDeleteRequest:
 			initialData.Params = &schemas.VideoLogParams{
 				VideoID: req.VideoDeleteRequest.ID,
+			}
+		case schemas.PassthroughRequest, schemas.PassthroughStreamRequest:
+			initialData.Params = &schemas.PassthroughLogParams{
+				Method:   req.PassthroughRequest.Method,
+				Path:     req.PassthroughRequest.Path,
+				RawQuery: req.PassthroughRequest.RawQuery,
+			}
+			if len(req.PassthroughRequest.Body) > 0 {
+				initialData.PassthroughRequestBody = string(req.PassthroughRequest.Body)
 			}
 		}
 	}

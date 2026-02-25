@@ -5407,6 +5407,11 @@ func (provider *OpenAIProvider) BatchCancel(ctx *schemas.BifrostContext, keys []
 	return nil, lastErr
 }
 
+// BatchDelete is not supported by the OpenAI provider.
+func (provider *OpenAIProvider) BatchDelete(ctx *schemas.BifrostContext, keys []schemas.Key, request *schemas.BifrostBatchDeleteRequest) (*schemas.BifrostBatchDeleteResponse, *schemas.BifrostError) {
+	return nil, providerUtils.NewUnsupportedOperationError(schemas.BatchDeleteRequest, provider.GetProviderKey())
+}
+
 // BatchResults retrieves batch results by trying each key until successful.
 // Note: For OpenAI, batch results are obtained by downloading the output_file_id.
 // This method returns the file content parsed as batch results.
@@ -6581,4 +6586,13 @@ func (provider *OpenAIProvider) ContainerFileDelete(ctx *schemas.BifrostContext,
 	}
 
 	return nil, lastErr
+}
+
+// Passthrough is not supported by the OpenAI provider.
+func (provider *OpenAIProvider) Passthrough(_ *schemas.BifrostContext, _ schemas.Key, _ *schemas.BifrostPassthroughRequest) (*schemas.BifrostPassthroughResponse, *schemas.BifrostError) {
+	return nil, providerUtils.NewUnsupportedOperationError(schemas.PassthroughRequest, provider.GetProviderKey())
+}
+
+func (provider *OpenAIProvider) PassthroughStream(_ *schemas.BifrostContext, _ schemas.Key, _ *schemas.BifrostPassthroughRequest) (*schemas.BifrostPassthroughStreamResponse, *schemas.BifrostError) {
+	return nil, providerUtils.NewUnsupportedOperationError(schemas.PassthroughStreamRequest, provider.GetProviderKey())
 }

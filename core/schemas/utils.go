@@ -3,6 +3,7 @@ package schemas
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"math/rand"
 	"net/url"
 	"regexp"
@@ -1365,4 +1366,22 @@ func SameBaseModel(a, b string) bool {
 
 	// Compare normalized base names.
 	return BaseModelName(a) == BaseModelName(b)
+}
+
+// readCloserWithHook wraps an io.ReadCloser and fires a hook exactly once on Close.
+// Used to trigger PostLLMHook when the transport finishes consuming a passthrough stream.
+type readCloserWithHook struct {
+	io.ReadCloser
+	once sync.Once
+	hook func()
+}
+
+func (r *readCloserWithHook) Close() error {
+	err := r.ReadCloser.Close()
+	r.once.Do(r.hook)
+	return err
+}
+
+func WrapOnClose(rc io.ReadCloser, fn func()) io.ReadCloser {
+	return &readCloserWithHook{ReadCloser: rc, hook: fn}
 }

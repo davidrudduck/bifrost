@@ -5,6 +5,7 @@ import (
 	"mime"
 	"path"
 	"path/filepath"
+	"slices"
 	"strings"
 
 	"github.com/fasthttp/router"
@@ -54,6 +55,20 @@ func (h *UIHandler) serveDashboard(ctx *fasthttp.RequestCtx) {
 		cleanPath = "ui/index.html"
 	} else {
 		cleanPath = "ui" + cleanPath
+	}
+
+	// Block sensitive files
+	baseName := filepath.Base(cleanPath)
+	if strings.HasPrefix(baseName, ".") {
+		ctx.SetStatusCode(fasthttp.StatusNotFound)
+		ctx.SetBodyString("404 - Not found")
+		return
+	}
+	sensitiveFiles := []string{"package.json", "package-lock.json"}
+	if slices.Contains(sensitiveFiles, baseName) {
+		ctx.SetStatusCode(fasthttp.StatusNotFound)
+		ctx.SetBodyString("404 - Not found")
+		return
 	}
 
 	// Check if this is a static asset request (has file extension)

@@ -119,7 +119,7 @@ fi
 echo ""
 
 # Build Newman command
-cmd=(newman run "$COLLECTION" --timeout-script 300000 -r "$REPORTERS")
+cmd=(newman run "$COLLECTION" --timeout-script 120000 --timeout 900000 -r "$REPORTERS")
 
 if [[ "$REPORTERS" == *"html"* ]]; then
     cmd+=(--reporter-html-export "$REPORT_DIR/report.html")
